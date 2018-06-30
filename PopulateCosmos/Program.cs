@@ -23,6 +23,8 @@ namespace PopulateCosmos
     {
         private static DateTime last = DateTime.Now;
 
+        private const int Limit = -1; // No limit
+
         public static async Task Main(string[] args)
         {
             // Azure Cosmos DB Configuration variables
@@ -151,7 +153,7 @@ namespace PopulateCosmos
                     },
                 "sisId");
 
-            var teacherRosterDictionary = CreateJsonDictionaryFromCsv(
+            var teacherRosterLookup = CreateJsonLookupFromCsv(
                 Path.Combine(directory, "teacherroster.csv"),
                 new Dictionary<string, int>
                     {
@@ -165,7 +167,7 @@ namespace PopulateCosmos
                     },
                 "sisId");
 
-            var studentEnrollmentDictionary = CreateJsonDictionaryFromCsv(
+            var studentEnrollmentLookup = CreateJsonLookupFromCsv(
                 Path.Combine(directory, "studentenrollment.csv"),
                 new Dictionary<string, int>
                     {
@@ -195,6 +197,7 @@ namespace PopulateCosmos
                 // Clean the database
                 await gremlinClient.SubmitAsync<dynamic>("g.E().drop()");
                 await gremlinClient.SubmitAsync<dynamic>("g.V().drop()");
+                Console.WriteLine($"Database cleaned.");
 
                 await PopulateDictionaryVertices(schoolDictionary, gremlinClient, "school", "schoolSisId");
                 await PopulateDictionaryVertices(
@@ -214,7 +217,7 @@ namespace PopulateCosmos
                     "hasUser",
                     schoolDictionary);
                 await PopulateDictionaryEdges(
-                    teacherRosterDictionary,
+                    teacherRosterLookup,
                     gremlinClient,
                     "sectionSisId",
                     sectionDictionary,
@@ -223,7 +226,7 @@ namespace PopulateCosmos
                     userDictionary,
                     "inClass");
                 await PopulateDictionaryEdges(
-                    studentEnrollmentDictionary,
+                    studentEnrollmentLookup,
                     gremlinClient,
                     "sectionSisId",
                     sectionDictionary,
@@ -237,7 +240,7 @@ namespace PopulateCosmos
         }
 
         private static async Task PopulateDictionaryEdges(
-            Dictionary<string, JObject> edgeDictionary,
+            ILookup<string, JObject> edgeDictionary,
             GremlinClient gremlinClient,
             string lhsId,
             Dictionary<string, JObject> lhsDictionary,
@@ -246,33 +249,49 @@ namespace PopulateCosmos
             Dictionary<string, JObject> rhsDictionary,
             string rhsRelName)
         {
-            foreach (var element in edgeDictionary.Values)
+            int i = 0;
+            foreach (var edgeGroup in edgeDictionary)
             {
-                if (lhsDictionary.TryGetValue(element[lhsId].ToString(), out JObject lhsElement))
+                foreach (var element in edgeGroup)
                 {
-                    if (rhsDictionary.TryGetValue(element[rhsId].ToString(), out JObject rhsElement))
+                    if (lhsDictionary.TryGetValue(element[lhsId].ToString(), out JObject lhsElement))
                     {
-                        string lhsVertexId = lhsElement["vertexId"].ToString();
-                        string rhsVertexId = rhsElement["vertexId"].ToString();
+                        if (rhsDictionary.TryGetValue(element[rhsId].ToString(), out JObject rhsElement))
+                        {
+                            if (!(lhsElement.TryGetValue("vertexId", out JToken lhsVertexIdToken)
+                                  && rhsElement.TryGetValue("vertexId", out JToken rhsVertexIdToken)))
+                            {
+                                continue;
+                            }
 
-                        // Add the foward link
-                        string addForward = $"g.V('{lhsVertexId}').addE('{lhsRelName}').to(g.V('{rhsVertexId}'))";
-                        await gremlinClient.SubmitAsync<dynamic>(addForward);
+                            var lhsVertexId = lhsVertexIdToken.ToString();
+                            var rhsVertexId = rhsVertexIdToken.ToString();
 
-                        var now = DateTime.Now;
-                        TimeSpan span = now - last;
-                        last = now;
-                        Console.WriteLine($"{lhsRelName} edge added from {lhsVertexId} to {rhsVertexId}: {span.Milliseconds}");
+                            // Add the foward link
+                            string addForward = $"g.V('{lhsVertexId}').addE('{lhsRelName}').to(g.V('{rhsVertexId}'))";
+                            await gremlinClient.SubmitAsync<dynamic>(addForward);
 
-                        // Add the reverse link
-                        string addReverse = $"g.V('{rhsVertexId}').addE('{rhsRelName}').to(g.V('{lhsVertexId}'))";
-                        await gremlinClient.SubmitAsync<dynamic>(addReverse);
+                            var now = DateTime.Now;
+                            TimeSpan span = now - last;
+                            last = now;
+                            Console.WriteLine(
+                                $"{lhsRelName} edge added from {lhsVertexId} to {rhsVertexId}: {span.Milliseconds}");
 
-                        now = DateTime.Now;
-                        span = now - last;
-                        last = now;
-                        Console.WriteLine($"{rhsRelName} edge added from {rhsVertexId} to {lhsVertexId}: {span.Milliseconds}");
+                            // Add the reverse link
+                            string addReverse = $"g.V('{rhsVertexId}').addE('{rhsRelName}').to(g.V('{lhsVertexId}'))";
+                            await gremlinClient.SubmitAsync<dynamic>(addReverse);
 
+                            now = DateTime.Now;
+                            span = now - last;
+                            last = now;
+                            Console.WriteLine(
+                                $"{i}: {rhsRelName} edge added from {rhsVertexId} to {lhsVertexId}: {span.Milliseconds}");
+
+                            if (i++ == Limit)
+                            {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -287,6 +306,8 @@ namespace PopulateCosmos
             string reverseRelName = null,
             Dictionary<string, JObject> secondaryDictionary = null)
         {
+            int i = 0;
+
             IReadOnlyCollection<dynamic> result;
             foreach (var element in dictionary.Values)
             {
@@ -295,6 +316,7 @@ namespace PopulateCosmos
                 {
                     command.Append($".property('{prop.Name}', '{prop.Value}')");
                 }
+                command.Append(".as('newVert')");
 
                 JObject secondaryElement = null;
                 if (secondaryDictionary != null)
@@ -303,28 +325,49 @@ namespace PopulateCosmos
                     if (secondaryDictionary.TryGetValue(element[lookupIdField].ToString(), out secondaryElement))
                     {
                         command.Append($".addE('{toParentRelName}').to(g.V('{secondaryElement["vertexId"]}'))");
+                        command.Append($".addE('{reverseRelName}').from(g.V('{secondaryElement["vertexId"]}')).to('newVert')");
                     }
                 }
 
                 result = await gremlinClient.SubmitAsync<dynamic>(command.ToString());
-                dynamic vertex = result.FirstOrDefault();
-                if (vertex != null)
+                dynamic createResult = result.FirstOrDefault();
+                if (createResult == null)
                 {
-                    var vertexId = (string)vertex["id"];
-                    element.Add(new JProperty("vertexId", vertexId));
-                    var now = DateTime.Now;
-                    TimeSpan span = now - last;
-                    last = now;
-                    Console.WriteLine($"{vertexLabel} vertex added: {vertex["id"]}: {span.Milliseconds}");
+                    throw new InvalidOperationException("No results from vertex add.");
+                }
 
-
-                    // Add the reverse link
-                    if (secondaryElement != null)
+                string vertexId = null;
+                if ((string)createResult["type"] == "vertex")
+                {
+                    vertexId = (string)createResult["id"];
+                }
+                else if ((string)createResult["type"] == "edge")
+                {
+                    if ((string)createResult["inVLabel"] == vertexLabel)
                     {
-                        string addReverse =
-                            $"g.V('{secondaryElement["vertexId"]}').addE('{reverseRelName}').to(g.V('{vertexId}'))";
-                        result = await gremlinClient.SubmitAsync<dynamic>(addReverse);
+                        vertexId = (string)createResult["inV"];
                     }
+                    else if ((string)createResult["outVLabel"] == vertexLabel)
+                    {
+                        vertexId = (string)createResult["outV"];
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(vertexId))
+                {
+                    throw new InvalidOperationException("No vertexId found.");
+                }
+
+                element.Add(new JProperty("vertexId", vertexId));
+
+                var now = DateTime.Now;
+                TimeSpan span = now - last;
+                last = now;
+                Console.WriteLine($"{i}: {vertexLabel} vertex added: {createResult["id"]}: {span.Milliseconds}");
+
+                if (i++ == Limit)
+                {
+                    return;
                 }
             }
         }
@@ -353,10 +396,23 @@ namespace PopulateCosmos
             Dictionary<string, int> fieldMapping,
             string key)
         {
+            Console.WriteLine($"Reading: {csvFile}");
             var csvStrings = GetCsvContents(csvFile);
             var dictionary = csvStrings.Select(stringArray => CreateJObjectFromStrings(fieldMapping, stringArray))
                                        .ToDictionary(j => j[key].ToString());
             return dictionary;
+        }
+
+        private static ILookup<string, JObject> CreateJsonLookupFromCsv(
+            string csvFile,
+            Dictionary<string, int> fieldMapping,
+            string key)
+        {
+            Console.WriteLine($"Reading: {csvFile}");
+            var csvStrings = GetCsvContents(csvFile);
+            var lookup = csvStrings.Select(stringArray => CreateJObjectFromStrings(fieldMapping, stringArray))
+                                       .ToLookup(j => j[key].ToString());
+            return lookup;
         }
 
         private static void AppendToJsonDictionaryFromCsv(
