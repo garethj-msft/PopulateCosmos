@@ -21,6 +21,8 @@ namespace PopulateCosmos
 
     public partial class Program
     {
+        private static DateTime last = DateTime.Now;
+
         public static async Task Main(string[] args)
         {
             // Azure Cosmos DB Configuration variables
@@ -149,8 +151,7 @@ namespace PopulateCosmos
                     },
                 "sisId");
 
-            DecorateJsonDictionaryEntriesFromCsv(
-                sectionDictionary,
+            var teacherRosterDictionary = CreateJsonDictionaryFromCsv(
                 Path.Combine(directory, "teacherroster.csv"),
                 new Dictionary<string, int>
                     {
@@ -162,11 +163,9 @@ namespace PopulateCosmos
                         { "entryDate", 5 },
                         { "exitDate", 6 },
                     },
-                "sectionSisId",
-                "teachers");
+                "sisId");
 
-            DecorateJsonDictionaryEntriesFromCsv(
-                sectionDictionary,
+            var studentEnrollmentDictionary = CreateJsonDictionaryFromCsv(
                 Path.Combine(directory, "studentenrollment.csv"),
                 new Dictionary<string, int>
                     {
@@ -178,8 +177,7 @@ namespace PopulateCosmos
                         { "entryDate", 5 },
                         { "exitDate", 6 },
                     },
-                "sectionSisId",
-                "students");
+                "sisId");
 
             var gremlinServer = new GremlinServer(
                 hostname,
@@ -195,22 +193,99 @@ namespace PopulateCosmos
                 GremlinClient.GraphSON2MimeType))
             {
                 // Clean the database
-                var result = await gremlinClient.SubmitAsync<dynamic>("g.E().drop()");
-                var result = await gremlinClient.SubmitAsync<dynamic>("g.V().drop()");
+                await gremlinClient.SubmitAsync<dynamic>("g.E().drop()");
+                await gremlinClient.SubmitAsync<dynamic>("g.V().drop()");
 
-                await PopulateDictionaryVertices(schoolDictionary, gremlinClient, "school");
-                await PopulateDictionaryVertices(sectionDictionary, gremlinClient, "class", schoolDictionary);
-                await PopulateDictionaryVertices(userDictionary, gremlinClient, "user", schoolDictionary);
+                await PopulateDictionaryVertices(schoolDictionary, gremlinClient, "school", "schoolSisId");
+                await PopulateDictionaryVertices(
+                    sectionDictionary,
+                    gremlinClient,
+                    "class",
+                    "schoolSisId",
+                    "inSchool",
+                    "hasSection",
+                    schoolDictionary);
+                await PopulateDictionaryVertices(
+                    userDictionary,
+                    gremlinClient,
+                    "user",
+                    "schoolSisId",
+                    "inSchool",
+                    "hasUser",
+                    schoolDictionary);
+                await PopulateDictionaryEdges(
+                    teacherRosterDictionary,
+                    gremlinClient,
+                    "sectionSisId",
+                    sectionDictionary,
+                    "hasTeacher",
+                    "sisId",
+                    userDictionary,
+                    "inClass");
+                await PopulateDictionaryEdges(
+                    studentEnrollmentDictionary,
+                    gremlinClient,
+                    "sectionSisId",
+                    sectionDictionary,
+                    "hasStudent",
+                    "sisId",
+                    userDictionary,
+                    "inClass");
             }
 
             Console.ReadLine();
+        }
+
+        private static async Task PopulateDictionaryEdges(
+            Dictionary<string, JObject> edgeDictionary,
+            GremlinClient gremlinClient,
+            string lhsId,
+            Dictionary<string, JObject> lhsDictionary,
+            string lhsRelName,
+            string rhsId,
+            Dictionary<string, JObject> rhsDictionary,
+            string rhsRelName)
+        {
+            foreach (var element in edgeDictionary.Values)
+            {
+                if (lhsDictionary.TryGetValue(element[lhsId].ToString(), out JObject lhsElement))
+                {
+                    if (rhsDictionary.TryGetValue(element[rhsId].ToString(), out JObject rhsElement))
+                    {
+                        string lhsVertexId = lhsElement["vertexId"].ToString();
+                        string rhsVertexId = rhsElement["vertexId"].ToString();
+
+                        // Add the foward link
+                        string addForward = $"g.V('{lhsVertexId}').addE('{lhsRelName}').to(g.V('{rhsVertexId}'))";
+                        await gremlinClient.SubmitAsync<dynamic>(addForward);
+
+                        var now = DateTime.Now;
+                        TimeSpan span = now - last;
+                        last = now;
+                        Console.WriteLine($"{lhsRelName} edge added from {lhsVertexId} to {rhsVertexId}: {span.Milliseconds}");
+
+                        // Add the reverse link
+                        string addReverse = $"g.V('{rhsVertexId}').addE('{rhsRelName}').to(g.V('{lhsVertexId}'))";
+                        await gremlinClient.SubmitAsync<dynamic>(addReverse);
+
+                        now = DateTime.Now;
+                        span = now - last;
+                        last = now;
+                        Console.WriteLine($"{rhsRelName} edge added from {rhsVertexId} to {lhsVertexId}: {span.Milliseconds}");
+
+                    }
+                }
+            }
         }
 
         private static async Task PopulateDictionaryVertices(
             Dictionary<string, JObject> dictionary,
             GremlinClient gremlinClient,
             string vertexLabel,
-            Dictionary<string, JObject> schoolDictionary = null)
+            string lookupIdField,
+            string toParentRelName = null,
+            string reverseRelName = null,
+            Dictionary<string, JObject> secondaryDictionary = null)
         {
             IReadOnlyCollection<dynamic> result;
             foreach (var element in dictionary.Values)
@@ -221,12 +296,13 @@ namespace PopulateCosmos
                     command.Append($".property('{prop.Name}', '{prop.Value}')");
                 }
 
-                if (schoolDictionary != null)
+                JObject secondaryElement = null;
+                if (secondaryDictionary != null)
                 {
-                    // Find the school object for the element
-                    if (schoolDictionary.TryGetValue(element["schoolSisId"].ToString(), out JObject school))
+                    // Find the parent object for the element
+                    if (secondaryDictionary.TryGetValue(element[lookupIdField].ToString(), out secondaryElement))
                     {
-                        command.Append($".addE('inSchool').to(g.V('{school["vertexId"]}'))");
+                        command.Append($".addE('{toParentRelName}').to(g.V('{secondaryElement["vertexId"]}'))");
                     }
                 }
 
@@ -234,17 +310,35 @@ namespace PopulateCosmos
                 dynamic vertex = result.FirstOrDefault();
                 if (vertex != null)
                 {
-                    element.Add(new JProperty("vertexId", (string)vertex["id"]));
-                    Console.WriteLine($"Vertex added: {vertex["id"]}");
+                    var vertexId = (string)vertex["id"];
+                    element.Add(new JProperty("vertexId", vertexId));
+                    var now = DateTime.Now;
+                    TimeSpan span = now - last;
+                    last = now;
+                    Console.WriteLine($"{vertexLabel} vertex added: {vertex["id"]}: {span.Milliseconds}");
+
+
+                    // Add the reverse link
+                    if (secondaryElement != null)
+                    {
+                        string addReverse =
+                            $"g.V('{secondaryElement["vertexId"]}').addE('{reverseRelName}').to(g.V('{vertexId}'))";
+                        result = await gremlinClient.SubmitAsync<dynamic>(addReverse);
+                    }
                 }
             }
         }
 
-        private static void DecorateJsonDictionaryEntriesFromCsv(Dictionary<string, JObject> dictionaryToDecorate, string csvFile, Dictionary<string, int> fieldMapping, string parentKey, string decorationName)
+        private static void DecorateJsonDictionaryEntriesFromCsv(
+            Dictionary<string, JObject> dictionaryToDecorate,
+            string csvFile,
+            Dictionary<string, int> fieldMapping,
+            string parentKey,
+            string decorationName)
         {
             var csvStrings = GetCsvContents(csvFile);
-            var parentLookup = csvStrings.Select(
-                stringArray => CreateJObjectFromStrings(fieldMapping, stringArray)).ToLookup(j => j[parentKey].ToString());
+            var parentLookup = csvStrings.Select(stringArray => CreateJObjectFromStrings(fieldMapping, stringArray))
+                                         .ToLookup(j => j[parentKey].ToString());
             foreach (var newGroup in parentLookup)
             {
                 if (dictionaryToDecorate.TryGetValue(newGroup.Key, out var elementToDecorate))
@@ -260,8 +354,8 @@ namespace PopulateCosmos
             string key)
         {
             var csvStrings = GetCsvContents(csvFile);
-            var dictionary = csvStrings.Select(
-                stringArray => CreateJObjectFromStrings(fieldMapping, stringArray)).ToDictionary(j => j[key].ToString());
+            var dictionary = csvStrings.Select(stringArray => CreateJObjectFromStrings(fieldMapping, stringArray))
+                                       .ToDictionary(j => j[key].ToString());
             return dictionary;
         }
 
@@ -272,8 +366,8 @@ namespace PopulateCosmos
             string key)
         {
             var csvStrings = GetCsvContents(csvFile);
-            var newDictionary = csvStrings.Select(
-                stringArray => CreateJObjectFromStrings(fieldMapping, stringArray)).ToDictionary(j => j[key].ToString());
+            var newDictionary = csvStrings.Select(stringArray => CreateJObjectFromStrings(fieldMapping, stringArray))
+                                          .ToDictionary(j => j[key].ToString());
             foreach (var newKey in newDictionary.Keys)
             {
                 dictionary.Add(newKey, newDictionary[newKey]);
@@ -307,11 +401,13 @@ namespace PopulateCosmos
             TextFieldParser textFieldParser = null;
             try
             {
-                textFieldParser = new TextFieldParser(fileStream);
-                textFieldParser.TextFieldType = FieldType.Delimited;
+                textFieldParser = new TextFieldParser(fileStream)
+                    {
+                        TextFieldType = FieldType.Delimited,
+                        HasFieldsEnclosedInQuotes = true,
+                        TrimWhiteSpace = true
+                    };
                 textFieldParser.SetDelimiters(delimiter);
-                textFieldParser.HasFieldsEnclosedInQuotes = true;
-                textFieldParser.TrimWhiteSpace = true;
 
                 while (!textFieldParser.EndOfData)
                 {
