@@ -8,17 +8,33 @@ using Microsoft.VisualBasic.FileIO;
 
 namespace PopulateCosmos
 {
+    using System.Data;
     using System.Dynamic;
     using System.IO;
+
+    using Gremlin.Net.Driver;
+    using Gremlin.Net.Structure.IO.GraphSON;
 
     using Newtonsoft.Json.Converters;
     using Newtonsoft.Json.Linq;
 
-    class Program
+    public partial class Program
     {
-        static void Main(string[] args)
+        public static async Task Main(string[] args)
         {
+            // Azure Cosmos DB Configuration variables
+            string hostname = "https://storageprototype.gremlin.cosmosdb.azure.com";
+
+            int port = 443;
+
+            var authKey = AuthKey;
+
+            string database = "educationDatabase";
+
+            string collection = "educationRoster";
+
             string directory = null;
+
             // Assume first arg is the directory containing the CSVs or PWD.
             if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
             {
@@ -164,9 +180,32 @@ namespace PopulateCosmos
                 "sectionSisId",
                 "students");
 
-            foreach (var school in schoolDictionary.Values)
+            var gremlinServer = new GremlinServer(
+                hostname,
+                port,
+                enableSsl: true,
+                username: "/dbs/" + database + "/colls/" + collection,
+                password: authKey);
+
+            using (var gremlinClient = new GremlinClient(
+                gremlinServer,
+                new GraphSON2Reader(),
+                new GraphSON2Writer(),
+                GremlinClient.GraphSON2MimeType))
             {
-                Console.WriteLine(school.ToString());
+                // Clean the database
+                var result = await gremlinClient.SubmitAsync<dynamic>("g.V().drop()");
+
+                foreach (var school in schoolDictionary.Values)
+                {
+                    var command = new StringBuilder("g.addV('school')");
+                    foreach (var prop in school.Properties())
+                    {
+                        command.Append($".property('${prop.Name}', '${prop.Value}')");
+                    }
+
+                    result = await gremlinClient.SubmitAsync<dynamic>(command.ToString());
+                }
             }
 
             Console.ReadLine();
