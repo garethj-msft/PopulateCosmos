@@ -8,6 +8,7 @@ using Microsoft.VisualBasic.FileIO;
 
 namespace PopulateCosmos
 {
+    using System.ComponentModel;
     using System.Data;
     using System.Dynamic;
     using System.IO;
@@ -23,7 +24,7 @@ namespace PopulateCosmos
         public static async Task Main(string[] args)
         {
             // Azure Cosmos DB Configuration variables
-            string hostname = "https://storageprototype.gremlin.cosmosdb.azure.com";
+            string hostname = "storageprototype.gremlin.cosmosdb.azure.com";
 
             int port = 443;
 
@@ -194,35 +195,49 @@ namespace PopulateCosmos
                 GremlinClient.GraphSON2MimeType))
             {
                 // Clean the database
+                var result = await gremlinClient.SubmitAsync<dynamic>("g.E().drop()");
                 var result = await gremlinClient.SubmitAsync<dynamic>("g.V().drop()");
 
-                foreach (var school in schoolDictionary.Values)
-                {
-                    var command = new StringBuilder("g.addV('school')");
-                    foreach (var prop in school.Properties())
-                    {
-                        command.Append($".property('${prop.Name}', '${prop.Value}')");
-                    }
+                await PopulateDictionaryVertices(schoolDictionary, gremlinClient, "school");
+                await PopulateDictionaryVertices(sectionDictionary, gremlinClient, "class", schoolDictionary);
+                await PopulateDictionaryVertices(userDictionary, gremlinClient, "user", schoolDictionary);
+            }
 
-                    result = await gremlinClient.SubmitAsync<dynamic>(command.ToString());
+            Console.ReadLine();
+        }
+
+        private static async Task PopulateDictionaryVertices(
+            Dictionary<string, JObject> dictionary,
+            GremlinClient gremlinClient,
+            string vertexLabel,
+            Dictionary<string, JObject> schoolDictionary = null)
+        {
+            IReadOnlyCollection<dynamic> result;
+            foreach (var element in dictionary.Values)
+            {
+                var command = new StringBuilder("g.addV('" + vertexLabel + "')");
+                foreach (var prop in element.Properties())
+                {
+                    command.Append($".property('{prop.Name}', '{prop.Value}')");
+                }
+
+                if (schoolDictionary != null)
+                {
+                    // Find the school object for the element
+                    if (schoolDictionary.TryGetValue(element["schoolSisId"].ToString(), out JObject school))
+                    {
+                        command.Append($".addE('inSchool').to(g.V('{school["vertexId"]}'))");
+                    }
+                }
+
+                result = await gremlinClient.SubmitAsync<dynamic>(command.ToString());
+                dynamic vertex = result.FirstOrDefault();
+                if (vertex != null)
+                {
+                    element.Add(new JProperty("vertexId", (string)vertex["id"]));
+                    Console.WriteLine($"Vertex added: {vertex["id"]}");
                 }
             }
-
-            Console.ReadLine();
-
-            foreach (var section in sectionDictionary.Values)
-            {
-                Console.WriteLine(section.ToString());
-            }
-
-            Console.ReadLine();
-
-            foreach (var user in userDictionary.Values)
-            {
-                Console.WriteLine(user.ToString());
-            }
-
-            Console.ReadLine();
         }
 
         private static void DecorateJsonDictionaryEntriesFromCsv(Dictionary<string, JObject> dictionaryToDecorate, string csvFile, Dictionary<string, int> fieldMapping, string parentKey, string decorationName)
